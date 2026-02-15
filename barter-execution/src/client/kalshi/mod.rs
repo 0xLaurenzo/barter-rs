@@ -6,6 +6,7 @@
 
 pub mod http;
 pub mod model;
+pub mod ws;
 
 use self::http::{KalshiHttpClient, KalshiHttpConfig, KalshiHttpError};
 use self::model::KalshiCreateOrder;
@@ -35,7 +36,7 @@ use futures::{stream::BoxStream, StreamExt};
 use rust_decimal::Decimal;
 use smol_str::SmolStr;
 use tokio_stream::wrappers::IntervalStream;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 /// Configuration for the Kalshi execution client.
 #[derive(Debug, Clone)]
@@ -138,13 +139,13 @@ impl ExecutionClient for KalshiExecution {
         _assets: &[AssetNameExchange],
         _instruments: &[InstrumentNameExchange],
     ) -> Result<Self::AccountStream, UnindexedClientError> {
-        // Kalshi has no user WebSocket. Poll for order updates.
+        // Balance polling stream (existing behavior)
         let interval = tokio::time::interval(
             std::time::Duration::from_millis(self.poll_interval_ms),
         );
         let http = self.http.clone();
 
-        let stream = IntervalStream::new(interval).filter_map(move |_| {
+        let balance_stream = IntervalStream::new(interval).filter_map(move |_| {
             let http = http.clone();
             async move {
                 match http.fetch_balance().await {
@@ -173,7 +174,37 @@ impl ExecutionClient for KalshiExecution {
             }
         });
 
-        Ok(Box::pin(stream))
+        // Extract unique tickers from instrument names ("{ticker}_{yes|no}")
+        let tickers: Vec<String> = _instruments
+            .iter()
+            .filter_map(|name| Self::parse_instrument(name).map(|(ticker, _)| ticker))
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+
+        // Attempt WS fill connection; fall back to balance-only on failure
+        match ws::connect_kalshi_fills(
+            self.http.api_key(),
+            self.http.private_key(),
+            self.http.is_demo(),
+            &tickers,
+        )
+        .await
+        {
+            Ok(websocket) => {
+                info!("Kalshi fill WS connected, merging with balance polling");
+                let fill_stream = ws::kalshi_fill_stream(websocket);
+                let merged = tokio_stream::StreamExt::merge(
+                    tokio_stream::StreamExt::fuse(balance_stream),
+                    tokio_stream::StreamExt::fuse(fill_stream),
+                );
+                Ok(Box::pin(merged))
+            }
+            Err(e) => {
+                warn!(error = %e, "Kalshi fill WS connection failed, using balance-only polling");
+                Ok(Box::pin(balance_stream))
+            }
+        }
     }
 
     async fn cancel_order(

@@ -40,6 +40,21 @@ pub struct KalshiHttpConfig {
 }
 
 impl KalshiHttpClient {
+    /// API key for authenticated requests.
+    pub fn api_key(&self) -> &str {
+        &self.api_key
+    }
+
+    /// RSA private key for request signing.
+    pub fn private_key(&self) -> &RsaPrivateKey {
+        &self.private_key
+    }
+
+    /// Whether this client targets the demo environment.
+    pub fn is_demo(&self) -> bool {
+        self.base_url.contains("demo")
+    }
+
     /// Create a new Kalshi HTTP client.
     pub fn new(config: KalshiHttpConfig) -> Result<Self, KalshiHttpError> {
         let private_key = RsaPrivateKey::from_pkcs8_pem(&config.private_key_pem)

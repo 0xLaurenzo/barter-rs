@@ -10,6 +10,7 @@
 pub mod http;
 pub mod model;
 pub mod signing;
+pub mod ws;
 
 use self::http::{PolymarketHttpClient, PolymarketHttpError};
 use self::model::*;
@@ -41,7 +42,7 @@ use futures::{stream::BoxStream, StreamExt};
 use rust_decimal::Decimal;
 use smol_str::SmolStr;
 use tokio_stream::wrappers::IntervalStream;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 /// Configuration for the Polymarket execution client.
 #[derive(Debug, Clone)]
@@ -158,14 +159,13 @@ impl ExecutionClient for PolymarketExecution {
         _assets: &[AssetNameExchange],
         _instruments: &[InstrumentNameExchange],
     ) -> Result<Self::AccountStream, UnindexedClientError> {
-        // Polymarket has a user WS, but for initial implementation use polling.
-        // Can be upgraded to wss://ws-subscriptions-clob.polymarket.com/ws/user later.
+        // Balance polling stream (existing behavior)
         let interval = tokio::time::interval(
             std::time::Duration::from_millis(self.poll_interval_ms),
         );
         let http = self.http.clone();
 
-        let stream = IntervalStream::new(interval).filter_map(move |_| {
+        let balance_stream = IntervalStream::new(interval).filter_map(move |_| {
             let http = http.clone();
             async move {
                 match http.fetch_balance().await {
@@ -196,7 +196,38 @@ impl ExecutionClient for PolymarketExecution {
             }
         });
 
-        Ok(Box::pin(stream))
+        // Polymarket instrument names are token IDs (asset_ids).
+        // The user WS subscribes by condition ID (market), but passing
+        // asset_ids also works as the server resolves them.
+        let markets: Vec<String> = _instruments
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+
+        // Attempt WS fill connection; fall back to balance-only on failure
+        let creds = self.http.credentials();
+        match ws::connect_polymarket_user(
+            &creds.api_key,
+            &creds.api_secret,
+            &creds.api_passphrase,
+            &markets,
+        )
+        .await
+        {
+            Ok(websocket) => {
+                info!("Polymarket user WS connected, merging with balance polling");
+                let (fill_stream, _ping_handle) = ws::polymarket_fill_stream(websocket);
+                let merged = tokio_stream::StreamExt::merge(
+                    tokio_stream::StreamExt::fuse(balance_stream),
+                    tokio_stream::StreamExt::fuse(fill_stream),
+                );
+                Ok(Box::pin(merged))
+            }
+            Err(e) => {
+                warn!(error = %e, "Polymarket user WS connection failed, using balance-only polling");
+                Ok(Box::pin(balance_stream))
+            }
+        }
     }
 
     async fn cancel_order(

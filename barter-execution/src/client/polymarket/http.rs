@@ -16,6 +16,11 @@ pub struct PolymarketHttpClient {
 }
 
 impl PolymarketHttpClient {
+    /// Access the API credentials.
+    pub fn credentials(&self) -> &PolymarketApiCredentials {
+        &self.credentials
+    }
+
     /// Create a new Polymarket HTTP client.
     pub fn new(credentials: PolymarketApiCredentials) -> Self {
         Self {

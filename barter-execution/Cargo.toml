@@ -40,6 +40,9 @@ serde_json = { workspace = true }
 # HTTP Client
 reqwest = { workspace = true }
 
+# WebSocket
+url = { workspace = true }
+
 # Cryptographic Signatures
 rsa = { workspace = true }
 sha2 = { workspace = true }
