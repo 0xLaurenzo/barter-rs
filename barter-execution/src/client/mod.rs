@@ -19,7 +19,9 @@ use futures::Stream;
 use std::future::Future;
 
 mod binance;
+pub mod kalshi;
 pub mod mock;
+pub mod polymarket;
 
 pub trait ExecutionClient
 where

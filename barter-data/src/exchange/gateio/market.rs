@@ -72,6 +72,10 @@ fn gateio_market(instrument: &MarketDataInstrument) -> GateioMarket {
                     OptionKind::Put => "P",
                 },
             ),
+            Prediction(_) => {
+                // Gateio does not support prediction markets
+                panic!("Gateio does not support prediction market instruments")
+            }
         }
         .to_uppercase_smolstr(),
     )

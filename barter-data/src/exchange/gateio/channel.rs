@@ -43,6 +43,10 @@ where
                 GateioChannel::FUTURE_TRADES
             }
             MarketDataInstrumentKind::Option { .. } => GateioChannel::OPTION_TRADES,
+            MarketDataInstrumentKind::Prediction { .. } => {
+                // Gateio does not support prediction markets
+                panic!("Gateio does not support prediction market instruments")
+            }
         }
     }
 }

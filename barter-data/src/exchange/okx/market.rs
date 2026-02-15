@@ -67,6 +67,10 @@ fn okx_market(instrument: &MarketDataInstrument) -> OkxMarket {
             },
         )
         .to_uppercase_smolstr(),
+        Prediction(_) => {
+            // Okx does not support prediction markets
+            panic!("Okx does not support prediction market instruments")
+        }
     })
 }
 

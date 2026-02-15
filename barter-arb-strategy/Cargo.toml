@@ -1,0 +1,54 @@
+[package]
+name = "barter-arb-strategy"
+version = "0.1.0"
+edition = "2021"
+description = "Prediction market arbitrage strategy for the barter trading ecosystem"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/barter-rs/barter-prediction"
+keywords = ["trading", "arbitrage", "prediction-markets", "kalshi", "polymarket"]
+categories = ["finance"]
+
+[dependencies]
+# Barter Ecosystem
+barter = { path = "../barter" }
+barter-data = { path = "../barter-data" }
+barter-execution = { path = "../barter-execution" }
+barter-instrument = { path = "../barter-instrument" }
+barter-integration = { path = "../barter-integration" }
+
+# Async
+tokio = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+
+# Data Structures
+rust_decimal = { workspace = true }
+smol_str = { workspace = true }
+indexmap = { workspace = true }
+
+# SerDe
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Time
+chrono = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+
+# HTTP client for Supabase
+reqwest = { workspace = true }
+url = { workspace = true }
+
+# Misc
+derive_more = { workspace = true }
+
+[dev-dependencies]
+rust_decimal_macros = { workspace = true }
+tokio-test = { workspace = true }
+futures-util = { workspace = true }
+tracing-subscriber = { workspace = true }

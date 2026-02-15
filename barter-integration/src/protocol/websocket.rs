@@ -59,12 +59,21 @@ impl StreamParser for WebSocketParser {
 }
 
 /// Process a payload of `String` by deserialising into an `ExchangeMessage`.
+///
+/// Returns `None` for non-JSON control text frames (PONG, PING) to skip them
+/// without generating deserialization errors.
 pub fn process_text<ExchangeMessage>(
     payload: Utf8Bytes,
 ) -> Option<Result<ExchangeMessage, SocketError>>
 where
     ExchangeMessage: DeserializeOwned,
 {
+    // Skip non-JSON keepalive text frames (e.g. Polymarket sends "PONG" as text)
+    let trimmed = payload.as_str().trim();
+    if trimmed.eq_ignore_ascii_case("PONG") || trimmed.eq_ignore_ascii_case("PING") {
+        return None;
+    }
+
     Some(
         serde_json::from_str::<ExchangeMessage>(&payload).map_err(|error| {
             debug!(
@@ -144,6 +153,70 @@ where
         .await
         .map(|(websocket, _)| websocket)
         .map_err(|error| SocketError::WebSocket(Box::new(error)))
+}
+
+/// Connect asynchronously to a [`WebSocket`] server with custom headers.
+///
+/// # Arguments
+/// * `url` - The WebSocket URL to connect to
+/// * `headers` - Iterator of (header_name, header_value) tuples
+pub async fn connect_with_headers<I>(
+    url: url::Url,
+    headers: I,
+) -> Result<WebSocket, SocketError>
+where
+    I: IntoIterator<Item = (&'static str, String)>,
+{
+    use tokio_tungstenite::tungstenite::http::{Request, Uri, header::HeaderValue};
+
+    // Build HTTP request with headers
+    let uri: Uri = url
+        .as_str()
+        .parse()
+        .map_err(|_| SocketError::UrlParse(url::ParseError::InvalidIpv6Address))?;
+
+    let host = url.host_str().unwrap_or("localhost");
+
+    let mut request_builder = Request::builder()
+        .uri(uri)
+        .header("Host", host)
+        .header("Connection", "Upgrade")
+        .header("Upgrade", "websocket")
+        .header("Sec-WebSocket-Version", "13")
+        .header("Sec-WebSocket-Key", generate_websocket_key());
+
+    // Add custom headers
+    for (name, value) in headers {
+        request_builder = request_builder.header(
+            name,
+            HeaderValue::from_str(&value).map_err(|_| {
+                SocketError::Subscribe(format!("Invalid header value for {}", name))
+            })?,
+        );
+    }
+
+    let request = request_builder
+        .body(())
+        .map_err(|e| SocketError::Subscribe(format!("Failed to build request: {}", e)))?;
+
+    debug!(?request, "attempting to establish WebSocket connection with custom headers");
+    connect_async(request)
+        .await
+        .map(|(websocket, _)| websocket)
+        .map_err(|error| SocketError::WebSocket(Box::new(error)))
+}
+
+/// Generate a random WebSocket key for the Sec-WebSocket-Key header.
+fn generate_websocket_key() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    base64::Engine::encode(
+        &base64::engine::general_purpose::STANDARD,
+        &nonce.to_le_bytes(),
+    )
 }
 
 /// Determine whether a [`WsError`] indicates the [`WebSocket`] has disconnected.

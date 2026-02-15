@@ -74,6 +74,10 @@ pub enum ExchangeId {
     Mexc,
     Okx,
     Poloniex,
+    /// Kalshi prediction market exchange
+    Kalshi,
+    /// Polymarket prediction market exchange
+    Polymarket,
 }
 
 impl ExchangeId {
@@ -122,6 +126,8 @@ impl ExchangeId {
             ExchangeId::Mexc => "mexc",
             ExchangeId::Okx => "okx",
             ExchangeId::Poloniex => "poloniex",
+            ExchangeId::Kalshi => "kalshi",
+            ExchangeId::Polymarket => "polymarket",
         }
     }
 }

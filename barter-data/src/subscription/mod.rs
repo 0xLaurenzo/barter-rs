@@ -195,7 +195,7 @@ pub fn exchange_supports_instrument_kind(
         // Spot
         (
             BinanceFuturesUsd | Bitmex | BybitPerpetualsUsd | GateioPerpetualsUsd
-            | GateioPerpetualsBtc,
+            | GateioPerpetualsBtc | Kalshi | Polymarket,
             Spot,
         ) => false,
         (_, Spot) => true,
@@ -215,6 +215,10 @@ pub fn exchange_supports_instrument_kind(
         // Option
         (GateioOptions | Okx, Option { .. }) => true,
         (_, Option { .. }) => false,
+
+        // Prediction
+        (Kalshi | Polymarket, Prediction { .. }) => true,
+        (_, Prediction { .. }) => false,
     }
 }
 
@@ -273,6 +277,10 @@ pub fn exchange_supports_instrument_kind_sub_kind(
         (GateioOptions, Option { .. }, PublicTrades) => true,
         (Kraken, Spot, PublicTrades | OrderBooksL1) => true,
         (Okx, Spot | Future { .. } | Perpetual | Option { .. }, PublicTrades) => true,
+
+        // Prediction markets: Kalshi and Polymarket
+        (Kalshi, Prediction { .. }, PublicTrades | OrderBooksL2) => true,
+        (Polymarket, Prediction { .. }, PublicTrades | OrderBooksL2) => true,
 
         (_, _, _) => false,
     }

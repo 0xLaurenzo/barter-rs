@@ -36,6 +36,12 @@ pub mod kraken;
 /// `Okx` [`Connector`] and [`StreamSelector`] implementations.
 pub mod okx;
 
+/// `Kalshi` [`Connector`] and [`StreamSelector`] implementations for prediction markets.
+pub mod kalshi;
+
+/// `Polymarket` [`Connector`] and [`StreamSelector`] implementations for prediction markets.
+pub mod polymarket;
+
 /// Defines the generic [`ExchangeSub`] containing a market and channel combination used by an
 /// exchange [`Connector`] to build [`WsMessage`] subscription payloads.
 pub mod subscription;

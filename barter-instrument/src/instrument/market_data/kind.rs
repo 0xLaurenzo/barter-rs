@@ -6,6 +6,23 @@ use std::fmt::{Display, Formatter};
 
 /// Defines the type of [`MarketDataInstrument`](super::MarketDataInstrument) which is being
 /// traded on a given `base_quote` market.
+/// Outcome side for prediction market instruments (YES or NO)
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Outcome {
+    Yes,
+    No,
+}
+
+impl std::fmt::Display for Outcome {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Outcome::Yes => write!(f, "yes"),
+            Outcome::No => write!(f, "no"),
+        }
+    }
+}
+
 #[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MarketDataInstrumentKind {
@@ -13,6 +30,8 @@ pub enum MarketDataInstrumentKind {
     Perpetual,
     Future(MarketDataFutureContract),
     Option(MarketDataOptionContract),
+    /// Prediction market instrument with YES/NO outcomes
+    Prediction(MarketDataPredictionContract),
 }
 
 impl Default for MarketDataInstrumentKind {
@@ -38,6 +57,11 @@ impl Display for MarketDataInstrumentKind {
                     contract.expiry.date_naive(),
                     contract.strike,
                 ),
+                MarketDataInstrumentKind::Prediction(contract) => format!(
+                    "prediction_{}_{}-UTC",
+                    contract.outcome,
+                    contract.expiry.date_naive(),
+                ),
             }
         )
     }
@@ -56,4 +80,14 @@ pub struct MarketDataOptionContract {
     #[serde(with = "chrono::serde::ts_milliseconds")]
     pub expiry: DateTime<Utc>,
     pub strike: Decimal,
+}
+
+/// Prediction market contract representing a binary outcome (YES/NO) for a specific question
+#[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Debug, Deserialize, Serialize)]
+pub struct MarketDataPredictionContract {
+    /// The outcome side this contract represents (YES or NO)
+    pub outcome: Outcome,
+    /// When the prediction market resolves/settles
+    #[serde(with = "chrono::serde::ts_milliseconds")]
+    pub expiry: DateTime<Utc>,
 }
