@@ -11,12 +11,15 @@ use barter_data::{
     subscription::book::OrderBookEvent,
 };
 use barter_execution::{
-    AccountEvent,
+    AccountEvent, AccountEventKind,
     order::request::{OrderRequestCancel, OrderRequestOpen},
 };
+use barter_instrument::Side;
 use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use tracing::info;
 
 /// Type alias for the arbitrage engine state.
 pub type ArbitrageEngineState = EngineState<ArbitrageGlobalData, ArbitrageInstrumentData>;
@@ -182,24 +185,64 @@ impl<InstrumentKey> Processor<&MarketEvent<InstrumentKey, DataKind>>
     }
 }
 
-impl<ExchangeKey, AssetKey, InstrumentKey>
-    Processor<&AccountEvent<ExchangeKey, AssetKey, InstrumentKey>> for ArbitrageInstrumentData
+impl<ExchangeKey, AssetKey, InstrumentKey> Processor<&AccountEvent<ExchangeKey, AssetKey, InstrumentKey>>
+    for ArbitrageInstrumentData
+where
+    ExchangeKey: std::fmt::Debug,
+    InstrumentKey: std::fmt::Debug,
 {
     type Audit = ();
 
     fn process(
         &mut self,
-        _event: &AccountEvent<ExchangeKey, AssetKey, InstrumentKey>,
+        event: &AccountEvent<ExchangeKey, AssetKey, InstrumentKey>,
     ) -> Self::Audit {
-        // Position updates handled by engine's built-in position tracking
+        match &event.kind {
+            AccountEventKind::Trade(trade) => {
+                let signed_qty = match trade.side {
+                    Side::Buy => trade.quantity.to_i32().unwrap_or(0),
+                    Side::Sell => -trade.quantity.to_i32().unwrap_or(0),
+                };
+                info!(
+                    instrument = ?trade.instrument,
+                    side = ?trade.side,
+                    price = %trade.price,
+                    quantity = %trade.quantity,
+                    fees = %trade.fees.fees,
+                    trade_id = %trade.id.0,
+                    "Trade fill received"
+                );
+                self.update_position(signed_qty, trade.price);
+            }
+            _ => {}
+        }
     }
 }
 
 impl<ExchangeKey, InstrumentKey> InFlightRequestRecorder<ExchangeKey, InstrumentKey>
     for ArbitrageInstrumentData
+where
+    ExchangeKey: std::fmt::Debug,
+    InstrumentKey: std::fmt::Debug,
 {
-    fn record_in_flight_cancel(&mut self, _: &OrderRequestCancel<ExchangeKey, InstrumentKey>) {}
-    fn record_in_flight_open(&mut self, _: &OrderRequestOpen<ExchangeKey, InstrumentKey>) {}
+    fn record_in_flight_cancel(&mut self, req: &OrderRequestCancel<ExchangeKey, InstrumentKey>) {
+        info!(
+            cid = %req.key.cid,
+            exchange = ?req.key.exchange,
+            "Cancel request in-flight"
+        );
+    }
+
+    fn record_in_flight_open(&mut self, req: &OrderRequestOpen<ExchangeKey, InstrumentKey>) {
+        info!(
+            cid = %req.key.cid,
+            exchange = ?req.key.exchange,
+            side = ?req.state.side,
+            price = %req.state.price,
+            quantity = %req.state.quantity,
+            "Order request in-flight"
+        );
+    }
 }
 
 impl<InstrumentKey, Kind> Processor<&MarketEvent<InstrumentKey, Kind>>
@@ -209,11 +252,33 @@ impl<InstrumentKey, Kind> Processor<&MarketEvent<InstrumentKey, Kind>>
     fn process(&mut self, _: &MarketEvent<InstrumentKey, Kind>) -> Self::Audit {}
 }
 
-impl<ExchangeKey, AssetKey, InstrumentKey>
-    Processor<&AccountEvent<ExchangeKey, AssetKey, InstrumentKey>> for ArbitrageGlobalData
+impl<ExchangeKey, AssetKey, InstrumentKey> Processor<&AccountEvent<ExchangeKey, AssetKey, InstrumentKey>>
+    for ArbitrageGlobalData
 {
     type Audit = ();
-    fn process(&mut self, _: &AccountEvent<ExchangeKey, AssetKey, InstrumentKey>) -> Self::Audit {}
+
+    fn process(
+        &mut self,
+        event: &AccountEvent<ExchangeKey, AssetKey, InstrumentKey>,
+    ) -> Self::Audit {
+        match &event.kind {
+            AccountEventKind::Trade(trade) => {
+                // Buy = deploying capital, Sell = releasing capital
+                let trade_value = trade.price * trade.quantity.abs();
+                match trade.side {
+                    Side::Buy => self.reserve_capital(trade_value),
+                    Side::Sell => self.release_capital(trade_value),
+                }
+            }
+            AccountEventKind::BalanceSnapshot(balance) => {
+                // Update platform-specific balance from polling.
+                // We can't distinguish Kalshi vs Poly here since ExchangeKey is generic,
+                // but the engine tracks balances in its own asset state anyway.
+                let _ = balance;
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Helper struct to look up orderbooks by prediction market key.
