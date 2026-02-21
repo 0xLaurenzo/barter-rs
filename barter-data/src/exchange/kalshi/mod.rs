@@ -1,7 +1,7 @@
 use self::{
     channel::KalshiChannel,
     market::KalshiMarket,
-    message::KalshiOrderbookSnapshot,
+    message::{KalshiOrderbookSnapshot, KalshiTrade},
     subscriber::KalshiAuthenticatedSubscriber,
     subscription::KalshiSubResponse,
 };
@@ -10,7 +10,7 @@ use crate::{
     exchange::{Connector, ExchangeSub, StreamSelector},
     instrument::InstrumentData,
     subscriber::validator::WebSocketSubValidator,
-    subscription::book::OrderBooksL2,
+    subscription::{book::OrderBooksL2, trade::PublicTrades},
     transformer::stateless::StatelessTransformer,
 };
 use barter_instrument::exchange::ExchangeId;
@@ -25,6 +25,9 @@ pub mod auth;
 
 /// OrderBook types for [`Kalshi`].
 pub mod book;
+
+/// Public trade types for [`Kalshi`].
+pub mod trade;
 
 /// Defines the type that translates a Barter [`Subscription`](crate::subscription::Subscription)
 /// into an exchange [`Connector`] specific channel used for generating [`Connector::requests`].
@@ -150,6 +153,16 @@ where
     type SnapFetcher = NoInitialSnapshots;
     type Stream = ExchangeWsStream<
         StatelessTransformer<Self, Instrument::Key, OrderBooksL2, KalshiOrderbookSnapshot>,
+    >;
+}
+
+impl<Instrument> StreamSelector<Instrument, PublicTrades> for Kalshi
+where
+    Instrument: InstrumentData,
+{
+    type SnapFetcher = NoInitialSnapshots;
+    type Stream = ExchangeWsStream<
+        StatelessTransformer<Self, Instrument::Key, PublicTrades, KalshiTrade>,
     >;
 }
 

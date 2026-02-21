@@ -2,6 +2,7 @@ use self::{
     channel::PolymarketChannel,
     market::PolymarketMarket,
     subscription::PolymarketSubResponse,
+    trade::PolymarketTradeMessage,
     transformer::PolymarketOrderBookTransformer,
 };
 use crate::{
@@ -9,7 +10,8 @@ use crate::{
     exchange::{Connector, ExchangeSub, PingInterval, StreamSelector},
     instrument::InstrumentData,
     subscriber::{WebSocketSubscriber, validator::WebSocketSubValidator},
-    subscription::book::OrderBooksL2,
+    subscription::{book::OrderBooksL2, trade::PublicTrades},
+    transformer::stateless::StatelessTransformer,
 };
 use barter_instrument::exchange::ExchangeId;
 use barter_integration::{error::SocketError, protocol::websocket::WsMessage};
@@ -20,6 +22,9 @@ use url::Url;
 
 /// OrderBook types for [`Polymarket`].
 pub mod book;
+
+/// Public trade types for [`Polymarket`].
+pub mod trade;
 
 /// Defines the type that translates a Barter [`Subscription`](crate::subscription::Subscription)
 /// into an exchange [`Connector`] specific channel used for generating [`Connector::requests`].
@@ -129,6 +134,16 @@ where
 {
     type SnapFetcher = NoInitialSnapshots;
     type Stream = ExchangeWsStream<PolymarketOrderBookTransformer<Instrument::Key>>;
+}
+
+impl<Instrument> StreamSelector<Instrument, PublicTrades> for Polymarket
+where
+    Instrument: InstrumentData,
+{
+    type SnapFetcher = NoInitialSnapshots;
+    type Stream = ExchangeWsStream<
+        StatelessTransformer<Self, Instrument::Key, PublicTrades, PolymarketTradeMessage>,
+    >;
 }
 
 #[cfg(test)]
