@@ -42,6 +42,7 @@
 //!         "0xno_token",
 //!         "BTC > $100k by Jan 31",
 //!         chrono::Utc::now() + chrono::Duration::days(30),
+//!         false, // not inverse
 //!     ),
 //! ];
 //!
@@ -62,20 +63,20 @@
 //! - **Kalshi**: 7% of profit potential: `0.07 * contracts * price * (1 - price)`
 //! - **Polymarket**: Configurable taker fee (default 50 basis points = 0.5%)
 //!
-//! # Market Model
+//! # Market Model (Delta-Neutral)
 //!
-//! Each correlated pair generates 4 orderbooks to monitor:
+//! Each correlated pair uses 2 YES orderbooks; NO asks are derived from YES bids:
 //!
 //! ```text
-//! Kalshi YES     <->    Polymarket YES
-//!     |                     |
-//! Kalshi NO      <->    Polymarket NO
+//! Buy YES on Platform A + Buy NO on Platform B = guaranteed $1 payout
+//! Profit = $1.00 - (YES_ask + NO_ask + fees)
 //! ```
 //!
-//! Arbitrage opportunities exist when:
-//! - Kalshi YES bid > Polymarket YES ask (buy Poly, sell Kalshi)
-//! - Polymarket YES bid > Kalshi YES ask (buy Kalshi, sell Poly)
-//! - Same for NO side
+//! Two directions per pair:
+//! - Buy Polymarket YES + Buy Kalshi NO
+//! - Buy Kalshi YES + Buy Polymarket NO
+//!
+//! With `inverse` flag, Kalshi YES/NO perspective is swapped before checking.
 
 pub mod config;
 pub mod correlation;

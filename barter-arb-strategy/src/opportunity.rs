@@ -1,97 +1,89 @@
-//! Arbitrage opportunity detection and representation.
+//! Delta-neutral arbitrage opportunity detection and representation.
+//!
+//! Strategy: Buy YES on one platform + Buy NO on the other = guaranteed $1 payout.
+//! Profit = $1.00 - (YES_ask + NO_ask + fees).
 
-use crate::{
-    correlation::{CorrelatedPair, Outcome, PredictionMarketKey},
-    fees::FeeCalculator,
-};
+use crate::correlation::{CorrelatedPair, Outcome, PredictionMarketKey};
 use barter_instrument::exchange::ExchangeId;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-/// Direction of the arbitrage trade.
+/// Direction of the delta-neutral arbitrage trade.
+///
+/// Both sides are always BUY orders on different platforms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 pub enum ArbitrageDirection {
-    /// Buy on Polymarket, sell on Kalshi
-    PolyToKalshi,
-    /// Buy on Kalshi, sell on Polymarket
-    KalshiToPoly,
+    /// Buy YES on Polymarket + Buy NO on Kalshi
+    YesPolyNoKalshi,
+    /// Buy YES on Kalshi + Buy NO on Polymarket
+    YesKalshiNoPoly,
 }
 
 impl ArbitrageDirection {
-    /// Get the exchange we're buying from.
-    pub fn buy_exchange(&self) -> ExchangeId {
+    /// Get the exchange where YES is bought.
+    pub fn yes_exchange(&self) -> ExchangeId {
         match self {
-            ArbitrageDirection::PolyToKalshi => ExchangeId::Polymarket,
-            ArbitrageDirection::KalshiToPoly => ExchangeId::Kalshi,
+            ArbitrageDirection::YesPolyNoKalshi => ExchangeId::Polymarket,
+            ArbitrageDirection::YesKalshiNoPoly => ExchangeId::Kalshi,
         }
     }
 
-    /// Get the exchange we're selling to.
-    pub fn sell_exchange(&self) -> ExchangeId {
+    /// Get the exchange where NO is bought.
+    pub fn no_exchange(&self) -> ExchangeId {
         match self {
-            ArbitrageDirection::PolyToKalshi => ExchangeId::Kalshi,
-            ArbitrageDirection::KalshiToPoly => ExchangeId::Polymarket,
+            ArbitrageDirection::YesPolyNoKalshi => ExchangeId::Kalshi,
+            ArbitrageDirection::YesKalshiNoPoly => ExchangeId::Polymarket,
         }
     }
 }
 
-/// One side of an arbitrage order.
+/// One side of a delta-neutral arbitrage order.
+///
+/// Both sides are always BUY orders.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct OrderSide {
-    /// Exchange for this side of the trade
+    /// Exchange for this side
     pub exchange: ExchangeId,
-    /// Instrument key for this side
+    /// Instrument key (includes exchange, market_id, outcome)
     pub instrument: PredictionMarketKey,
-    /// Price for this side
+    /// Outcome being bought (YES or NO)
+    pub outcome: Outcome,
+    /// Average price from depth walk
     pub price: Decimal,
-    /// Available size at this price
+    /// Number of contracts
     pub available_size: u32,
-    /// Action: true = buy, false = sell
-    pub is_buy: bool,
 }
 
 impl OrderSide {
-    /// Create a buy order side for Polymarket.
-    pub fn poly_buy(token_id: impl Into<smol_str::SmolStr>, outcome: Outcome, price: Decimal, size: u32) -> Self {
+    /// Create a BUY order side for Polymarket.
+    pub fn poly(
+        token_id: impl Into<smol_str::SmolStr>,
+        outcome: Outcome,
+        price: Decimal,
+        size: u32,
+    ) -> Self {
         Self {
             exchange: ExchangeId::Polymarket,
             instrument: PredictionMarketKey::new(ExchangeId::Polymarket, token_id, outcome),
+            outcome,
             price,
             available_size: size,
-            is_buy: true,
         }
     }
 
-    /// Create a sell order side for Polymarket.
-    pub fn poly_sell(token_id: impl Into<smol_str::SmolStr>, outcome: Outcome, price: Decimal, size: u32) -> Self {
-        Self {
-            exchange: ExchangeId::Polymarket,
-            instrument: PredictionMarketKey::new(ExchangeId::Polymarket, token_id, outcome),
-            price,
-            available_size: size,
-            is_buy: false,
-        }
-    }
-
-    /// Create a buy order side for Kalshi.
-    pub fn kalshi_buy(ticker: impl Into<smol_str::SmolStr>, outcome: Outcome, price: Decimal, size: u32) -> Self {
+    /// Create a BUY order side for Kalshi.
+    pub fn kalshi(
+        ticker: impl Into<smol_str::SmolStr>,
+        outcome: Outcome,
+        price: Decimal,
+        size: u32,
+    ) -> Self {
         Self {
             exchange: ExchangeId::Kalshi,
             instrument: PredictionMarketKey::new(ExchangeId::Kalshi, ticker, outcome),
+            outcome,
             price,
             available_size: size,
-            is_buy: true,
-        }
-    }
-
-    /// Create a sell order side for Kalshi.
-    pub fn kalshi_sell(ticker: impl Into<smol_str::SmolStr>, outcome: Outcome, price: Decimal, size: u32) -> Self {
-        Self {
-            exchange: ExchangeId::Kalshi,
-            instrument: PredictionMarketKey::new(ExchangeId::Kalshi, ticker, outcome),
-            price,
-            available_size: size,
-            is_buy: false,
         }
     }
 
@@ -101,67 +93,40 @@ impl OrderSide {
     }
 }
 
-/// A detected arbitrage opportunity between correlated markets.
+/// A detected delta-neutral arbitrage opportunity.
+///
+/// Profit condition: total_cost < $1.00 (guaranteed $1 payout at expiry).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ArbitrageOpportunity {
-    /// The correlated market pair this opportunity is for
+    /// The correlated market pair
     pub pair: CorrelatedPair,
-    /// Direction of the arbitrage
+    /// Direction: which platform gets YES vs NO
     pub direction: ArbitrageDirection,
-    /// The outcome being arbitraged (YES or NO)
-    pub outcome: Outcome,
-    /// Buy side of the trade
-    pub buy_side: OrderSide,
-    /// Sell side of the trade
-    pub sell_side: OrderSide,
-    /// Spread before fees (sell price - buy price)
-    pub spread_before_fees: Decimal,
-    /// Spread after fees
-    pub spread_after_fees: Decimal,
-    /// Maximum contracts we can trade (limited by liquidity)
+    /// YES side of the trade (always BUY)
+    pub yes_side: OrderSide,
+    /// NO side of the trade (always BUY)
+    pub no_side: OrderSide,
+    /// Total cost per contract: avg_yes + avg_no + fees/contract
+    pub total_cost: Decimal,
+    /// Weighted average YES price from depth walk
+    pub avg_yes_price: Decimal,
+    /// Weighted average NO price from depth walk
+    pub avg_no_price: Decimal,
+    /// Maximum contracts fillable at profitable levels
     pub max_contracts: u32,
-    /// Expected profit in dollars
+    /// Expected profit in dollars (sum across all filled levels)
     pub expected_profit: Decimal,
+    /// Total fees across both sides
+    pub total_fees: Decimal,
 }
 
 impl ArbitrageOpportunity {
-    /// Create a new arbitrage opportunity.
-    pub fn new(
-        pair: CorrelatedPair,
-        direction: ArbitrageDirection,
-        outcome: Outcome,
-        buy_side: OrderSide,
-        sell_side: OrderSide,
-        poly_fee_bps: u32,
-    ) -> Self {
-        let spread_before_fees = sell_side.price - buy_side.price;
-        let max_contracts = buy_side.available_size.min(sell_side.available_size);
-
-        let buy_is_kalshi = matches!(direction, ArbitrageDirection::KalshiToPoly);
-        let expected_profit = FeeCalculator::calculate_net_profit(
-            buy_side.price,
-            sell_side.price,
-            max_contracts,
-            buy_is_kalshi,
-            poly_fee_bps,
-        );
-
-        let spread_after_fees = if max_contracts > 0 {
-            expected_profit / Decimal::from(max_contracts)
+    /// Profit per contract (average across depth-walked levels).
+    pub fn profit_per_contract(&self) -> Decimal {
+        if self.max_contracts > 0 {
+            self.expected_profit / Decimal::from(self.max_contracts)
         } else {
             Decimal::ZERO
-        };
-
-        Self {
-            pair,
-            direction,
-            outcome,
-            buy_side,
-            sell_side,
-            spread_before_fees,
-            spread_after_fees,
-            max_contracts,
-            expected_profit,
         }
     }
 
@@ -170,28 +135,16 @@ impl ArbitrageOpportunity {
         self.expected_profit > Decimal::ZERO
     }
 
-    /// Check if this opportunity meets a minimum spread threshold.
-    pub fn meets_threshold(&self, min_spread: Decimal) -> bool {
-        self.spread_after_fees >= min_spread
-    }
-
-    /// Calculate profit for a specific number of contracts.
-    pub fn profit_for_contracts(&self, contracts: u32, poly_fee_bps: u32) -> Decimal {
-        let buy_is_kalshi = matches!(self.direction, ArbitrageDirection::KalshiToPoly);
-        FeeCalculator::calculate_net_profit(
-            self.buy_side.price,
-            self.sell_side.price,
-            contracts,
-            buy_is_kalshi,
-            poly_fee_bps,
-        )
+    /// Check if profit per contract meets a minimum threshold.
+    pub fn meets_threshold(&self, min_profit_per_contract: Decimal) -> bool {
+        self.profit_per_contract() >= min_profit_per_contract
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::DateTime;
+    use chrono::Utc;
     use rust_decimal_macros::dec;
 
     fn test_pair() -> CorrelatedPair {
@@ -201,65 +154,66 @@ mod tests {
             "0xyes_token",
             "0xno_token",
             "Test market",
-            DateTime::from_timestamp(1738368000, 0).unwrap(),
+            Utc::now() + chrono::Duration::days(30),
+            false,
         )
     }
 
     #[test]
     fn test_arbitrage_direction() {
-        let poly_to_kalshi = ArbitrageDirection::PolyToKalshi;
-        assert_eq!(poly_to_kalshi.buy_exchange(), ExchangeId::Polymarket);
-        assert_eq!(poly_to_kalshi.sell_exchange(), ExchangeId::Kalshi);
+        let d1 = ArbitrageDirection::YesPolyNoKalshi;
+        assert_eq!(d1.yes_exchange(), ExchangeId::Polymarket);
+        assert_eq!(d1.no_exchange(), ExchangeId::Kalshi);
 
-        let kalshi_to_poly = ArbitrageDirection::KalshiToPoly;
-        assert_eq!(kalshi_to_poly.buy_exchange(), ExchangeId::Kalshi);
-        assert_eq!(kalshi_to_poly.sell_exchange(), ExchangeId::Polymarket);
+        let d2 = ArbitrageDirection::YesKalshiNoPoly;
+        assert_eq!(d2.yes_exchange(), ExchangeId::Kalshi);
+        assert_eq!(d2.no_exchange(), ExchangeId::Polymarket);
     }
 
     #[test]
     fn test_order_side_value() {
-        let side = OrderSide::poly_buy("0xtoken", Outcome::Yes, dec!(0.40), 100);
+        let side = OrderSide::poly("0xtoken", Outcome::Yes, dec!(0.40), 100);
         assert_eq!(side.order_value(), dec!(40.0));
+        assert_eq!(side.outcome, Outcome::Yes);
     }
 
     #[test]
-    fn test_arbitrage_opportunity_creation() {
-        let pair = test_pair();
-        let buy_side = OrderSide::poly_buy("0xyes_token", Outcome::Yes, dec!(0.40), 100);
-        let sell_side = OrderSide::kalshi_sell("KXBTC-25JAN31-T100000", Outcome::Yes, dec!(0.45), 150);
+    fn test_profitable_opportunity() {
+        let opp = ArbitrageOpportunity {
+            pair: test_pair(),
+            direction: ArbitrageDirection::YesPolyNoKalshi,
+            yes_side: OrderSide::poly("0xyes_token", Outcome::Yes, dec!(0.40), 100),
+            no_side: OrderSide::kalshi("KXBTC-25JAN31-T100000", Outcome::No, dec!(0.54), 100),
+            total_cost: dec!(0.96),
+            avg_yes_price: dec!(0.40),
+            avg_no_price: dec!(0.54),
+            max_contracts: 100,
+            expected_profit: dec!(4.00),
+            total_fees: dec!(2.00),
+        };
 
-        let opp = ArbitrageOpportunity::new(
-            pair,
-            ArbitrageDirection::PolyToKalshi,
-            Outcome::Yes,
-            buy_side,
-            sell_side,
-            50, // 50 bps Polymarket fee
-        );
-
-        assert_eq!(opp.spread_before_fees, dec!(0.05));
-        assert_eq!(opp.max_contracts, 100);
         assert!(opp.is_profitable());
+        assert_eq!(opp.profit_per_contract(), dec!(0.04));
+        assert!(opp.meets_threshold(dec!(0.02)));
+        assert!(!opp.meets_threshold(dec!(0.05)));
     }
 
     #[test]
-    fn test_opportunity_threshold_check() {
-        let pair = test_pair();
-        let buy_side = OrderSide::poly_buy("0xyes_token", Outcome::Yes, dec!(0.40), 100);
-        let sell_side = OrderSide::kalshi_sell("KXBTC-25JAN31-T100000", Outcome::Yes, dec!(0.45), 150);
+    fn test_unprofitable_opportunity() {
+        let opp = ArbitrageOpportunity {
+            pair: test_pair(),
+            direction: ArbitrageDirection::YesPolyNoKalshi,
+            yes_side: OrderSide::poly("0xyes_token", Outcome::Yes, dec!(0.50), 0),
+            no_side: OrderSide::kalshi("KXBTC-25JAN31-T100000", Outcome::No, dec!(0.55), 0),
+            total_cost: dec!(1.05),
+            avg_yes_price: dec!(0.50),
+            avg_no_price: dec!(0.55),
+            max_contracts: 0,
+            expected_profit: Decimal::ZERO,
+            total_fees: Decimal::ZERO,
+        };
 
-        let opp = ArbitrageOpportunity::new(
-            pair,
-            ArbitrageDirection::PolyToKalshi,
-            Outcome::Yes,
-            buy_side,
-            sell_side,
-            50,
-        );
-
-        // Spread after fees should be around 3c, so 2% threshold should pass
-        assert!(opp.meets_threshold(dec!(0.02)));
-        // 5% threshold should fail
-        assert!(!opp.meets_threshold(dec!(0.05)));
+        assert!(!opp.is_profitable());
+        assert_eq!(opp.profit_per_contract(), Decimal::ZERO);
     }
 }

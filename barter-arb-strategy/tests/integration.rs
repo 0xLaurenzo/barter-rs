@@ -1,13 +1,14 @@
-//! Integration tests for the prediction market arbitrage strategy pipeline.
+//! Integration tests for the delta-neutral prediction market arbitrage strategy.
 //!
-//! Tests the full `generate_algo_orders` cycle using constructed engine state
-//! with synthetic orderbooks. No network calls.
+//! Tests the full opportunity detection pipeline using synthetic orderbooks.
+//! No network calls.
 
 use barter_arb_strategy::{
-    ArbitrageConfig, ArbitrageOpportunity, ArbitrageDirection, CorrelatedPair,
-    FeeCalculator, MinOrderValues, OrderSide, PredictionArbitrageStrategy,
+    ArbitrageConfig, ArbitrageDirection, CorrelatedPair, FeeCalculator,
+    MinOrderValues, PredictionArbitrageStrategy,
     correlation::{Outcome, PredictionMarketKey},
 };
+use barter_instrument::exchange::ExchangeId;
 use barter_data::books::{Level, OrderBook};
 use barter_execution::order::id::StrategyId;
 use chrono::{Duration, Utc};
@@ -27,6 +28,19 @@ fn pair(ticker: &str, yes_token: &str, no_token: &str, days: i64) -> CorrelatedP
         no_token,
         "Test market",
         Utc::now() + Duration::days(days),
+        false,
+    )
+}
+
+fn inverse_pair(ticker: &str, yes_token: &str, no_token: &str, days: i64) -> CorrelatedPair {
+    CorrelatedPair::new(
+        ticker,
+        "0xcond",
+        yes_token,
+        no_token,
+        "Test market (inverse)",
+        Utc::now() + Duration::days(days),
+        true,
     )
 }
 
@@ -53,138 +67,178 @@ fn book(bids: Vec<(Decimal, Decimal)>, asks: Vec<(Decimal, Decimal)>) -> OrderBo
     OrderBook::new(1, None, bid_levels, ask_levels)
 }
 
+/// Insert YES books for both platforms into the book map.
+fn insert_yes_books<'a>(
+    books: &mut HashMap<PredictionMarketKey, &'a OrderBook>,
+    pair: &CorrelatedPair,
+    poly_yes: &'a OrderBook,
+    kalshi_yes: &'a OrderBook,
+) {
+    books.insert(
+        PredictionMarketKey::polymarket_yes(pair.polymarket_yes_token.clone()),
+        poly_yes,
+    );
+    books.insert(
+        PredictionMarketKey::kalshi_yes(pair.kalshi_ticker.clone()),
+        kalshi_yes,
+    );
+}
+
 // ---------------------------------------------------------------------------
-// Test 1: Profitable spread generates orders
+// Test 1: Delta-neutral opportunity detected (poly YES + kalshi NO < $1)
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_profitable_spread_detects_opportunity() {
+fn test_delta_neutral_profitable_detected() {
     let p = pair("KXTEST", "0xyes", "0xno", 30);
     let s = strategy(default_config(), vec![p.clone()]);
 
-    // Poly YES ask 40c, Kalshi YES bid 46c → 6c raw spread
+    // Poly YES book: ask 40c, bid 38c
+    // → Poly NO asks derived: 1 - 0.38 = 62c
+    // Kalshi YES book: ask 48c, bid 55c
+    // → Kalshi NO asks derived: 1 - 0.55 = 45c
+    //
+    // Direction 1 (Poly YES + Kalshi NO): 0.40 + 0.45 = 0.85 + fees < 1.00 ✓
+    // Direction 2 (Kalshi YES + Poly NO): 0.48 + 0.62 = 1.10 > 1.00 ✗
     let poly_yes = book(
         vec![(dec!(0.38), dec!(100))],
         vec![(dec!(0.40), dec!(100))],
     );
     let kalshi_yes = book(
-        vec![(dec!(0.46), dec!(100))],
+        vec![(dec!(0.55), dec!(100))],
         vec![(dec!(0.48), dec!(100))],
     );
 
-    let mut books: HashMap<PredictionMarketKey, &OrderBook> = HashMap::new();
-    books.insert(PredictionMarketKey::polymarket_yes("0xyes"), &poly_yes);
-    books.insert(PredictionMarketKey::kalshi_yes("KXTEST"), &kalshi_yes);
+    let mut books = HashMap::new();
+    insert_yes_books(&mut books, &p, &poly_yes, &kalshi_yes);
 
     let opps = s.detect_opportunities(&books);
-    assert!(!opps.is_empty(), "Should detect at least one opportunity");
+    assert!(!opps.is_empty(), "Should detect delta-neutral opportunity");
 
     let opp = &opps[0];
-    assert_eq!(opp.direction, ArbitrageDirection::PolyToKalshi);
-    assert_eq!(opp.outcome, Outcome::Yes);
-    assert_eq!(opp.spread_before_fees, dec!(0.06));
+    assert_eq!(opp.direction, ArbitrageDirection::YesPolyNoKalshi);
     assert!(opp.is_profitable());
+    assert!(opp.total_cost < Decimal::ONE);
     assert!(opp.meets_threshold(dec!(0.02)));
 }
 
 // ---------------------------------------------------------------------------
-// Test 2: Sub-threshold spread produces no valid orders
+// Test 2: No opportunity when cost >= $1.00
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_sub_threshold_spread_filtered() {
+fn test_no_opportunity_when_cost_exceeds_one() {
+    let p = pair("KXTEST", "0xyes", "0xno", 30);
+    let s = strategy(default_config(), vec![p.clone()]);
+
+    // Poly YES ask 55c, Kalshi YES bid 40c → Kalshi NO ask = 60c
+    // Direction 1: 0.55 + 0.60 = 1.15 > 1.00
+    // Kalshi YES ask 52c, Poly YES bid 38c → Poly NO ask = 62c
+    // Direction 2: 0.52 + 0.62 = 1.14 > 1.00
+    let poly_yes = book(
+        vec![(dec!(0.38), dec!(100))],
+        vec![(dec!(0.55), dec!(100))],
+    );
+    let kalshi_yes = book(
+        vec![(dec!(0.40), dec!(100))],
+        vec![(dec!(0.52), dec!(100))],
+    );
+
+    let mut books = HashMap::new();
+    insert_yes_books(&mut books, &p, &poly_yes, &kalshi_yes);
+
+    let opps = s.detect_opportunities(&books);
+    assert!(opps.is_empty(), "No opportunity when cost >= $1.00");
+}
+
+// ---------------------------------------------------------------------------
+// Test 3: Sub-threshold profit filtered
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_sub_threshold_profit_filtered() {
     let p = pair("KXTEST", "0xyes", "0xno", 30);
     let mut config = default_config();
     config.min_spread_threshold = dec!(0.10); // Very high threshold
     let s = strategy(config, vec![p.clone()]);
 
-    // 6c raw spread → ~3c after fees, below 10c threshold
+    // Small profitable spread that won't meet 10c/contract threshold
     let poly_yes = book(
-        vec![(dec!(0.38), dec!(100))],
-        vec![(dec!(0.40), dec!(100))],
+        vec![(dec!(0.44), dec!(100))],
+        vec![(dec!(0.46), dec!(100))],
     );
     let kalshi_yes = book(
-        vec![(dec!(0.46), dec!(100))],
-        vec![(dec!(0.48), dec!(100))],
+        vec![(dec!(0.52), dec!(100))],
+        vec![(dec!(0.50), dec!(100))],
     );
 
-    let mut books: HashMap<PredictionMarketKey, &OrderBook> = HashMap::new();
-    books.insert(PredictionMarketKey::polymarket_yes("0xyes"), &poly_yes);
-    books.insert(PredictionMarketKey::kalshi_yes("KXTEST"), &kalshi_yes);
+    let mut books = HashMap::new();
+    insert_yes_books(&mut books, &p, &poly_yes, &kalshi_yes);
 
     let opps = s.detect_opportunities(&books);
-    // Opportunities exist but don't meet high threshold
     let valid: Vec<_> = opps
         .iter()
         .filter(|o| o.meets_threshold(dec!(0.10)))
         .collect();
-    assert!(valid.is_empty(), "No opportunity should meet 10c threshold");
+    assert!(valid.is_empty(), "Should not meet 10c/contract threshold");
 }
 
 // ---------------------------------------------------------------------------
-// Test 3: Position limit hit → no new orders
+// Test 4: Position limit enforced
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_position_limit_blocks_orders() {
+fn test_position_limit_enforced() {
     let p = pair("KXTEST", "0xyes", "0xno", 30);
     let mut config = default_config();
-    config.max_position_per_market = 10; // Very low limit
+    config.max_position_per_market = 10;
     let s = strategy(config, vec![p.clone()]);
 
-    // Large liquidity available but position limit is 10
     let poly_yes = book(
-        vec![(dec!(0.38), dec!(500))],
+        vec![(dec!(0.55), dec!(500))],
         vec![(dec!(0.40), dec!(500))],
     );
     let kalshi_yes = book(
-        vec![(dec!(0.46), dec!(500))],
+        vec![(dec!(0.55), dec!(500))],
         vec![(dec!(0.48), dec!(500))],
     );
 
-    let mut books: HashMap<PredictionMarketKey, &OrderBook> = HashMap::new();
-    books.insert(PredictionMarketKey::polymarket_yes("0xyes"), &poly_yes);
-    books.insert(PredictionMarketKey::kalshi_yes("KXTEST"), &kalshi_yes);
+    let mut books = HashMap::new();
+    insert_yes_books(&mut books, &p, &poly_yes, &kalshi_yes);
 
     let opps = s.detect_opportunities(&books);
     assert!(!opps.is_empty());
-
-    // max_contracts is min(buy_size, sell_size) = 500, exceeds limit of 10
-    let opp = &opps[0];
-    assert_eq!(opp.max_contracts, 500);
-    // The strategy checks max_contracts <= max_position_per_market
-    assert!(opp.max_contracts > 10);
+    // max_contracts from walk exceeds limit of 10
+    assert!(opps[0].max_contracts > 10);
 }
 
 // ---------------------------------------------------------------------------
-// Test 4: Expired market is skipped
+// Test 5: Expired market skipped
 // ---------------------------------------------------------------------------
 
 #[test]
 fn test_expired_market_skipped() {
-    // Expiry in the past
     let p = pair("KXTEST", "0xyes", "0xno", -1);
     let s = strategy(default_config(), vec![p.clone()]);
 
     let poly_yes = book(
-        vec![(dec!(0.38), dec!(100))],
+        vec![(dec!(0.55), dec!(100))],
         vec![(dec!(0.40), dec!(100))],
     );
     let kalshi_yes = book(
-        vec![(dec!(0.46), dec!(100))],
+        vec![(dec!(0.55), dec!(100))],
         vec![(dec!(0.48), dec!(100))],
     );
 
-    let mut books: HashMap<PredictionMarketKey, &OrderBook> = HashMap::new();
-    books.insert(PredictionMarketKey::polymarket_yes("0xyes"), &poly_yes);
-    books.insert(PredictionMarketKey::kalshi_yes("KXTEST"), &kalshi_yes);
+    let mut books = HashMap::new();
+    insert_yes_books(&mut books, &p, &poly_yes, &kalshi_yes);
 
     let opps = s.detect_opportunities(&books);
     assert!(opps.is_empty(), "Expired markets should produce no opportunities");
 }
 
 // ---------------------------------------------------------------------------
-// Test 5: Min order value filter
+// Test 6: Min order value filter
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -192,212 +246,155 @@ fn test_min_order_value_filters_small_orders() {
     let p = pair("KXTEST", "0xyes", "0xno", 30);
     let s = strategy(default_config(), vec![p.clone()]);
 
-    // Only 1 contract available at 40c → order value = $0.40 < $1.00 Poly minimum
+    // Only 1 contract available → Poly order value = 1 * 0.40 = $0.40 < $1 minimum
     let poly_yes = book(
-        vec![(dec!(0.38), dec!(1))],
+        vec![(dec!(0.55), dec!(1))],
         vec![(dec!(0.40), dec!(1))],
     );
     let kalshi_yes = book(
-        vec![(dec!(0.46), dec!(100))],
+        vec![(dec!(0.55), dec!(100))],
         vec![(dec!(0.48), dec!(100))],
     );
 
-    let mut books: HashMap<PredictionMarketKey, &OrderBook> = HashMap::new();
-    books.insert(PredictionMarketKey::polymarket_yes("0xyes"), &poly_yes);
-    books.insert(PredictionMarketKey::kalshi_yes("KXTEST"), &kalshi_yes);
+    let mut books = HashMap::new();
+    insert_yes_books(&mut books, &p, &poly_yes, &kalshi_yes);
 
     let opps = s.detect_opportunities(&books);
     assert!(!opps.is_empty());
 
-    // max_contracts = min(1, 100) = 1, buy_value = 1 * 0.40 = $0.40
     let opp = &opps[0];
-    assert_eq!(opp.max_contracts, 1);
-    assert_eq!(opp.buy_side.order_value(), dec!(0.40));
-    assert!(opp.buy_side.order_value() < dec!(1), "Order value below Poly minimum");
+    // Poly YES side has 1 contract at ~40c = $0.40
+    assert!(
+        opp.yes_side.order_value() < dec!(1),
+        "Poly order value should be below minimum"
+    );
 }
 
 // ---------------------------------------------------------------------------
-// Test 6: Multiple pairs, only one profitable
+// Test 7: Multiple pairs, only profitable ones detected
 // ---------------------------------------------------------------------------
 
 #[test]
 fn test_multiple_pairs_only_profitable_detected() {
     let p1 = pair("KX_GOOD", "0xyes1", "0xno1", 30);
-    let p2 = pair("KX_FLAT", "0xyes2", "0xno2", 30);
-    let p3 = pair("KX_REVERSED", "0xyes3", "0xno3", 30);
-    let s = strategy(default_config(), vec![p1.clone(), p2.clone(), p3.clone()]);
+    let p2 = pair("KX_BAD", "0xyes2", "0xno2", 30);
+    let s = strategy(default_config(), vec![p1.clone(), p2.clone()]);
 
-    // Pair 1: Profitable spread (6c)
-    let poly1 = book(vec![], vec![(dec!(0.40), dec!(100))]);
-    let kalshi1 = book(vec![(dec!(0.46), dec!(100))], vec![]);
+    // Pair 1: Profitable — Poly YES 40c + Kalshi NO (1-0.55=45c) = 85c < $1
+    let poly1 = book(
+        vec![(dec!(0.38), dec!(100))],
+        vec![(dec!(0.40), dec!(100))],
+    );
+    let kalshi1 = book(
+        vec![(dec!(0.55), dec!(100))],
+        vec![(dec!(0.48), dec!(100))],
+    );
 
-    // Pair 2: Zero spread (both at 45c)
-    let poly2 = book(vec![], vec![(dec!(0.45), dec!(100))]);
-    let kalshi2 = book(vec![(dec!(0.45), dec!(100))], vec![]);
+    // Pair 2: Not profitable — Poly YES 55c + Kalshi NO (1-0.40=60c) = 115c > $1
+    let poly2 = book(
+        vec![(dec!(0.38), dec!(100))],
+        vec![(dec!(0.55), dec!(100))],
+    );
+    let kalshi2 = book(
+        vec![(dec!(0.40), dec!(100))],
+        vec![(dec!(0.52), dec!(100))],
+    );
 
-    // Pair 3: Negative spread (Poly ask > Kalshi bid)
-    let poly3 = book(vec![], vec![(dec!(0.50), dec!(100))]);
-    let kalshi3 = book(vec![(dec!(0.44), dec!(100))], vec![]);
-
-    let mut books: HashMap<PredictionMarketKey, &OrderBook> = HashMap::new();
-    books.insert(PredictionMarketKey::polymarket_yes("0xyes1"), &poly1);
-    books.insert(PredictionMarketKey::kalshi_yes("KX_GOOD"), &kalshi1);
-    books.insert(PredictionMarketKey::polymarket_yes("0xyes2"), &poly2);
-    books.insert(PredictionMarketKey::kalshi_yes("KX_FLAT"), &kalshi2);
-    books.insert(PredictionMarketKey::polymarket_yes("0xyes3"), &poly3);
-    books.insert(PredictionMarketKey::kalshi_yes("KX_REVERSED"), &kalshi3);
+    let mut books = HashMap::new();
+    insert_yes_books(&mut books, &p1, &poly1, &kalshi1);
+    insert_yes_books(&mut books, &p2, &poly2, &kalshi2);
 
     let opps = s.detect_opportunities(&books);
-
-    // Only pair 1 has a positive spread
     assert_eq!(opps.len(), 1, "Only one pair should produce an opportunity");
     assert_eq!(opps[0].pair.kalshi_ticker.as_str(), "KX_GOOD");
 }
 
 // ---------------------------------------------------------------------------
-// Test 7: Both directions work (PolyToKalshi and KalshiToPoly)
+// Test 8: Both directions detected when both profitable
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_both_directions() {
+fn test_both_directions_when_both_profitable() {
     let p = pair("KXTEST", "0xyes", "0xno", 30);
     let s = strategy(default_config(), vec![p.clone()]);
 
-    // Set up books where BOTH directions have a spread:
-    // Direction 1 (PolyToKalshi YES): Poly ask 40c, Kalshi bid 46c → 6c spread
-    // Direction 2 (KalshiToPoly YES): Kalshi ask 48c, Poly bid 55c → 7c spread
+    // Create a book where both directions are profitable:
+    // Poly YES ask 30c, Poly YES bid 70c (wide spread)
+    // Kalshi YES ask 30c, Kalshi YES bid 70c
+    //
+    // Dir 1 (Poly YES + Kalshi NO): 0.30 + (1-0.70)=0.30 = 0.60 + fees < 1.00
+    // Dir 2 (Kalshi YES + Poly NO): 0.30 + (1-0.70)=0.30 = 0.60 + fees < 1.00
     let poly_yes = book(
-        vec![(dec!(0.55), dec!(100))], // Poly bids (for KalshiToPoly sell side)
-        vec![(dec!(0.40), dec!(100))], // Poly asks (for PolyToKalshi buy side)
+        vec![(dec!(0.70), dec!(100))],
+        vec![(dec!(0.30), dec!(100))],
     );
     let kalshi_yes = book(
-        vec![(dec!(0.46), dec!(100))], // Kalshi bids (for PolyToKalshi sell side)
-        vec![(dec!(0.48), dec!(100))], // Kalshi asks (for KalshiToPoly buy side)
+        vec![(dec!(0.70), dec!(100))],
+        vec![(dec!(0.30), dec!(100))],
     );
 
-    let mut books: HashMap<PredictionMarketKey, &OrderBook> = HashMap::new();
-    books.insert(PredictionMarketKey::polymarket_yes("0xyes"), &poly_yes);
-    books.insert(PredictionMarketKey::kalshi_yes("KXTEST"), &kalshi_yes);
+    let mut books = HashMap::new();
+    insert_yes_books(&mut books, &p, &poly_yes, &kalshi_yes);
 
     let opps = s.detect_opportunities(&books);
+    assert_eq!(opps.len(), 2, "Both directions should be profitable");
 
     let directions: Vec<_> = opps.iter().map(|o| o.direction).collect();
-    assert!(
-        directions.contains(&ArbitrageDirection::PolyToKalshi),
-        "Should detect PolyToKalshi"
-    );
-    assert!(
-        directions.contains(&ArbitrageDirection::KalshiToPoly),
-        "Should detect KalshiToPoly"
-    );
+    assert!(directions.contains(&ArbitrageDirection::YesPolyNoKalshi));
+    assert!(directions.contains(&ArbitrageDirection::YesKalshiNoPoly));
 }
 
 // ---------------------------------------------------------------------------
-// Test 8: Fee calculations match expected values
+// Test 9: Fee calculations match expected values
 // ---------------------------------------------------------------------------
 
 #[test]
 fn test_fee_calculations_edge_cases() {
-    // Edge case: price at 1c (near 0)
     let fee_low = FeeCalculator::kalshi_taker_fee(dec!(0.01), 100);
-    // 0.07 * 100 * 0.01 * 0.99 = 0.0693
     assert_eq!(fee_low, dec!(0.0693));
 
-    // Edge case: price at 99c (near 1)
     let fee_high = FeeCalculator::kalshi_taker_fee(dec!(0.99), 100);
-    // 0.07 * 100 * 0.99 * 0.01 = 0.0693
     assert_eq!(fee_high, dec!(0.0693));
 
-    // Symmetric: fee at price P equals fee at price (1-P)
+    // Symmetric around 50c
     let fee_40 = FeeCalculator::kalshi_taker_fee(dec!(0.40), 100);
     let fee_60 = FeeCalculator::kalshi_taker_fee(dec!(0.60), 100);
-    assert_eq!(fee_40, fee_60, "Fees should be symmetric around 50c");
+    assert_eq!(fee_40, fee_60);
 
-    // Max fee at 50c
     let fee_50 = FeeCalculator::kalshi_taker_fee(dec!(0.50), 100);
-    assert!(fee_50 > fee_40, "Fee at 50c should be highest");
+    assert!(fee_50 > fee_40);
 
-    // Zero contracts = zero fee
     let fee_zero = FeeCalculator::kalshi_taker_fee(dec!(0.50), 0);
     assert_eq!(fee_zero, Decimal::ZERO);
 }
 
 // ---------------------------------------------------------------------------
-// Test 9: Net profit calculation matches manual computation
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_net_profit_manual_verification() {
-    // Buy Poly at 40c, sell Kalshi at 46c, 100 contracts, 50bps Poly fee
-    // Gross = (0.46 - 0.40) * 100 = $6.00
-    // Poly fee = 100 * 0.40 * 0.0050 = $0.20
-    // Kalshi fee = 0.07 * 100 * 0.46 * 0.54 = $1.7388
-    // Net = 6.00 - 0.20 - 1.7388 = $4.0612
-    let profit = FeeCalculator::calculate_net_profit(
-        dec!(0.40),
-        dec!(0.46),
-        100,
-        false, // buy on Polymarket
-        50,
-    );
-    assert_eq!(profit, dec!(4.0612));
-}
-
-// ---------------------------------------------------------------------------
-// Test 10: NO side arbitrage detection
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_no_side_arbitrage() {
-    let p = pair("KXTEST", "0xyes", "0xno", 30);
-    let s = strategy(default_config(), vec![p.clone()]);
-
-    // NO side: Poly NO ask 35c, Kalshi NO bid 42c → 7c spread
-    let poly_no = book(
-        vec![(dec!(0.33), dec!(200))],
-        vec![(dec!(0.35), dec!(200))],
-    );
-    let kalshi_no = book(
-        vec![(dec!(0.42), dec!(200))],
-        vec![(dec!(0.44), dec!(200))],
-    );
-
-    let mut books: HashMap<PredictionMarketKey, &OrderBook> = HashMap::new();
-    books.insert(PredictionMarketKey::polymarket_no("0xno"), &poly_no);
-    books.insert(PredictionMarketKey::kalshi_no("KXTEST"), &kalshi_no);
-
-    let opps = s.detect_opportunities(&books);
-    assert!(!opps.is_empty(), "Should detect NO-side opportunity");
-
-    let opp = &opps[0];
-    assert_eq!(opp.outcome, Outcome::No);
-    assert_eq!(opp.direction, ArbitrageDirection::PolyToKalshi);
-    assert_eq!(opp.spread_before_fees, dec!(0.07));
-}
-
-// ---------------------------------------------------------------------------
-// Test 11: max_days_to_expiry filter
+// Test 10: max_days_to_expiry filter
 // ---------------------------------------------------------------------------
 
 #[test]
 fn test_max_days_to_expiry_filter() {
-    // Pair expires in 120 days, config limits to 90 days
     let p = pair("KXTEST", "0xyes", "0xno", 120);
     let s = strategy(default_config(), vec![p.clone()]);
 
-    let poly_yes = book(vec![], vec![(dec!(0.40), dec!(100))]);
-    let kalshi_yes = book(vec![(dec!(0.46), dec!(100))], vec![]);
+    let poly_yes = book(
+        vec![(dec!(0.55), dec!(100))],
+        vec![(dec!(0.40), dec!(100))],
+    );
+    let kalshi_yes = book(
+        vec![(dec!(0.55), dec!(100))],
+        vec![(dec!(0.48), dec!(100))],
+    );
 
-    let mut books: HashMap<PredictionMarketKey, &OrderBook> = HashMap::new();
-    books.insert(PredictionMarketKey::polymarket_yes("0xyes"), &poly_yes);
-    books.insert(PredictionMarketKey::kalshi_yes("KXTEST"), &kalshi_yes);
+    let mut books = HashMap::new();
+    insert_yes_books(&mut books, &p, &poly_yes, &kalshi_yes);
 
     let opps = s.detect_opportunities(&books);
     assert!(opps.is_empty(), "Market too far from expiry should be skipped");
 }
 
 // ---------------------------------------------------------------------------
-// Test 12: Missing orderbook data produces no opportunities
+// Test 11: Missing orderbook produces no opportunities
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -405,43 +402,127 @@ fn test_missing_orderbook_no_opportunities() {
     let p = pair("KXTEST", "0xyes", "0xno", 30);
     let s = strategy(default_config(), vec![p.clone()]);
 
-    // Only provide one side — missing Kalshi book
+    // Only Poly YES book, no Kalshi
     let poly_yes = book(
-        vec![(dec!(0.38), dec!(100))],
+        vec![(dec!(0.55), dec!(100))],
         vec![(dec!(0.40), dec!(100))],
     );
 
-    let mut books: HashMap<PredictionMarketKey, &OrderBook> = HashMap::new();
-    books.insert(PredictionMarketKey::polymarket_yes("0xyes"), &poly_yes);
+    let mut books = HashMap::new();
+    books.insert(
+        PredictionMarketKey::polymarket_yes("0xyes"),
+        &poly_yes as &OrderBook,
+    );
 
     let opps = s.detect_opportunities(&books);
     assert!(opps.is_empty(), "Missing orderbook should produce no opportunity");
 }
 
 // ---------------------------------------------------------------------------
-// Test 13: ArbitrageOpportunity profit_for_contracts
+// Test 12: Inverse pair detection
 // ---------------------------------------------------------------------------
 
 #[test]
-fn test_opportunity_profit_for_subset_contracts() {
-    let p = pair("KXTEST", "0xyes", "0xno", 30);
-    let buy_side = OrderSide::poly_buy("0xyes", Outcome::Yes, dec!(0.40), 200);
-    let sell_side = OrderSide::kalshi_sell("KXTEST", Outcome::Yes, dec!(0.46), 200);
-    let opp = ArbitrageOpportunity::new(
-        p,
-        ArbitrageDirection::PolyToKalshi,
-        Outcome::Yes,
-        buy_side,
-        sell_side,
-        50,
+fn test_inverse_pair_detection() {
+    let p = inverse_pair("KXTEST", "0xyes", "0xno", 30);
+    let s = strategy(default_config(), vec![p.clone()]);
+
+    // Kalshi YES book (= semantic NO in inverse): ask 45c, bid 55c
+    // Poly YES book: ask 40c
+    //
+    // With inverse, Direction 1 (Poly YES + "Kalshi NO"):
+    //   Uses poly_yes_asks(40c) + kalshi_yes_asks(45c) = 0.85 + fees < 1.00
+    let poly_yes = book(
+        vec![(dec!(0.38), dec!(100))],
+        vec![(dec!(0.40), dec!(100))],
+    );
+    let kalshi_yes = book(
+        vec![(dec!(0.55), dec!(100))],
+        vec![(dec!(0.45), dec!(100))],
     );
 
-    let profit_full = opp.expected_profit;
-    let profit_half = opp.profit_for_contracts(100, 50);
+    let mut books = HashMap::new();
+    insert_yes_books(&mut books, &p, &poly_yes, &kalshi_yes);
 
-    // Profit should scale linearly with contracts
-    assert!(profit_half > Decimal::ZERO);
-    // With 200 contracts full vs 100 half, profit should be ~2x
-    let ratio = profit_full / profit_half;
-    assert!(ratio > dec!(1.9) && ratio < dec!(2.1));
+    let opps = s.detect_opportunities(&books);
+    assert!(!opps.is_empty(), "Inverse pair should detect opportunity");
+
+    let opp = &opps[0];
+    assert_eq!(opp.direction, ArbitrageDirection::YesPolyNoKalshi);
+    assert!(opp.is_profitable());
+
+    // NO side should target Kalshi YES contract (inverse swap)
+    assert_eq!(opp.no_side.exchange, ExchangeId::Kalshi);
+    assert_eq!(opp.no_side.outcome, Outcome::Yes);
+}
+
+// ---------------------------------------------------------------------------
+// Test 13: Depth walking stops at unprofitable levels
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_depth_walking_stops_at_unprofitable() {
+    let p = pair("KXTEST", "0xyes", "0xno", 30);
+    let s = strategy(default_config(), vec![p.clone()]);
+
+    // Poly YES: 2 ask levels — 40c x 50, 48c x 100
+    // Kalshi YES bid: 55c x 200 → NO ask = 45c x 200
+    //
+    // Level 1: 0.40 + 0.45 = 0.85 + fees → profitable, fill 50
+    // Level 2: 0.48 + 0.45 = 0.93 + fees → profitable, fill 100 (limited by NO remaining)
+    // Then done (or if second level has high enough fee, stop)
+    let poly_yes = book(
+        vec![(dec!(0.35), dec!(200))], // bid
+        vec![
+            (dec!(0.40), dec!(50)),  // ask level 1
+            (dec!(0.48), dec!(100)), // ask level 2
+        ],
+    );
+    let kalshi_yes = book(
+        vec![(dec!(0.55), dec!(200))], // bid → NO ask = 45c
+        vec![(dec!(0.60), dec!(200))], // ask
+    );
+
+    let mut books = HashMap::new();
+    insert_yes_books(&mut books, &p, &poly_yes, &kalshi_yes);
+
+    let opps = s.detect_opportunities(&books);
+    assert!(!opps.is_empty());
+
+    let opp = &opps[0];
+    // Should fill at least the first level (50 contracts)
+    assert!(opp.max_contracts >= 50);
+    assert!(opp.is_profitable());
+}
+
+// ---------------------------------------------------------------------------
+// Test 14: All orders are BUY
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_all_orders_are_buy() {
+    let p = pair("KXTEST", "0xyes", "0xno", 30);
+    let s = strategy(default_config(), vec![p.clone()]);
+
+    let poly_yes = book(
+        vec![(dec!(0.55), dec!(100))],
+        vec![(dec!(0.40), dec!(100))],
+    );
+    let kalshi_yes = book(
+        vec![(dec!(0.55), dec!(100))],
+        vec![(dec!(0.48), dec!(100))],
+    );
+
+    let mut books = HashMap::new();
+    insert_yes_books(&mut books, &p, &poly_yes, &kalshi_yes);
+
+    let opps = s.detect_opportunities(&books);
+    assert!(!opps.is_empty());
+
+    // Both sides should be BUY (no sell orders in delta-neutral model)
+    let opp = &opps[0];
+    // YES side buys YES, NO side buys NO — both are purchases
+    assert_eq!(opp.yes_side.outcome, Outcome::Yes);
+    assert_eq!(opp.no_side.outcome, Outcome::No);
+    // No is_buy field needed — all orders are BUY by design
 }

@@ -138,6 +138,7 @@ impl MarketPairRecord {
             no_token,
             self.polymarket_question.as_deref().unwrap_or(""),
             expiry,
+            self.inverse.unwrap_or(false),
         ))
     }
 

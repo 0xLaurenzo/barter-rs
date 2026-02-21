@@ -23,6 +23,9 @@ pub struct CorrelatedPair {
     pub description: String,
     /// When the market resolves/expires
     pub expiry: DateTime<Utc>,
+    /// Whether Kalshi YES/NO are inverted relative to Polymarket
+    /// When true: Polymarket YES = Kalshi NO
+    pub inverse: bool,
 }
 
 impl CorrelatedPair {
@@ -34,6 +37,7 @@ impl CorrelatedPair {
         polymarket_no_token: impl Into<SmolStr>,
         description: impl Into<String>,
         expiry: DateTime<Utc>,
+        inverse: bool,
     ) -> Self {
         Self {
             kalshi_ticker: kalshi_ticker.into(),
@@ -42,6 +46,7 @@ impl CorrelatedPair {
             polymarket_no_token: polymarket_no_token.into(),
             description: description.into(),
             expiry,
+            inverse,
         }
     }
 
@@ -147,6 +152,7 @@ mod tests {
             "0xno_token",
             "Will BTC be above $100k on Jan 31?",
             DateTime::from_timestamp(1738368000, 0).unwrap(), // 2025-02-01
+            false,
         );
 
         assert_eq!(pair.kalshi_ticker.as_str(), "KXBTC-25JAN31-T100000");
